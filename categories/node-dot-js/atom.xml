@@ -2,10 +2,10 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
 
   <title><![CDATA[Category: node.js | apaprocki]]></title>
-  <link href="http://blog.paprocki.us/categories/node-dot-js/atom.xml" rel="self"/>
-  <link href="http://blog.paprocki.us/"/>
-  <updated>2013-06-03T16:40:00-04:00</updated>
-  <id>http://blog.paprocki.us/</id>
+  <link href="http://apaprocki.github.io/categories/node-dot-js/atom.xml" rel="self"/>
+  <link href="http://apaprocki.github.io/"/>
+  <updated>2013-06-03T16:41:33-04:00</updated>
+  <id>http://apaprocki.github.io/</id>
   <author>
     <name><![CDATA[Andrew Paprocki]]></name>
     
@@ -15,9 +15,9 @@
   
   <entry>
     <title type="html"><![CDATA[Implementing Timeouts in Node.js 'vm' Module]]></title>
-    <link href="http://blog.paprocki.us/2013/06/03/implementing-timeouts-in-node-dot-js-vm-module/"/>
+    <link href="http://apaprocki.github.io/2013/06/03/implementing-timeouts-in-node-dot-js-vm-module/"/>
     <updated>2013-06-03T09:52:00-04:00</updated>
-    <id>http://blog.paprocki.us/2013/06/03/implementing-timeouts-in-node-dot-js-vm-module</id>
+    <id>http://apaprocki.github.io/2013/06/03/implementing-timeouts-in-node-dot-js-vm-module</id>
     <content type="html"><![CDATA[<h3 id="trusted-but-unknown">Trusted, but Unknown</h3>
 
 <p>When I first started playing with the Node <a href="http://nodejs.org/api/vm.html"><code>vm</code></a> module, I was using

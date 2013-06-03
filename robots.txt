@@ -1,4 +1,4 @@
 User-agent: *
 Disallow: 
 
-Sitemap: http://blog.paprocki.us/sitemap.xml 
+Sitemap: http://apaprocki.github.io/sitemap.xml 
