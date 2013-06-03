@@ -1,0 +1,257 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+
+  <title><![CDATA[apaprocki]]></title>
+  <link href="http://blog.paprocki.us/atom.xml" rel="self"/>
+  <link href="http://blog.paprocki.us/"/>
+  <updated>2013-06-03T16:40:00-04:00</updated>
+  <id>http://blog.paprocki.us/</id>
+  <author>
+    <name><![CDATA[Andrew Paprocki]]></name>
+    
+  </author>
+  <generator uri="http://octopress.org/">Octopress</generator>
+
+  
+  <entry>
+    <title type="html"><![CDATA[Implementing Timeouts in Node.js 'vm' Module]]></title>
+    <link href="http://blog.paprocki.us/2013/06/03/implementing-timeouts-in-node-dot-js-vm-module/"/>
+    <updated>2013-06-03T09:52:00-04:00</updated>
+    <id>http://blog.paprocki.us/2013/06/03/implementing-timeouts-in-node-dot-js-vm-module</id>
+    <content type="html"><![CDATA[<h3 id="trusted-but-unknown">Trusted, but Unknown</h3>
+
+<p>When I first started playing with the Node <a href="http://nodejs.org/api/vm.html"><code>vm</code></a> module, I was using
+it to execute trusted, but unknown script.  Using the <code>vm</code> module as a
+sandbox was a great way to get a prototype up and running quickly, but
+presented a few problems if this type of prototype were to ever run in
+a production environment.  The goal of the prototype was to give other
+developers the ability to execute script they wrote inside of my app.
+Everyone makes typos and mistakes, and if a fellow developer asked the
+sandbox to execute something which entered an endless loop, it would loop
+the <code>node</code> process and defeat the purpose of a multi-user non-blocking app.
+<!-- more --></p>
+
+<p>There are a few possible solutions to this problem.  It’s possible to use
+separate processes, perhaps with the <code>cluster</code> module to kill processes if
+they loop, but it is not always desirable to use additional <code>pid</code>s.  To
+get even more complicated, an entire JS engine such as
+<a href="https://github.com/jterrace/js.js/">js.js</a> could be embedded, allowing
+the outer code to monitor the interpreter and stop execution if necessary.
+Hey, it’s possible, but I would not want to increase the maintenance,
+security, and performance complexity of my app in that manner unless there
+was no other option.  I wanted to keep loop detection in-process, which
+meant interfacing C++ loop detection with Node.</p>
+
+<p>My first attempt at achieving this was writing a native module,
+<a href="https://github.com/apaprocki/node-scriptdog">node-scriptdog</a>, at <a href="http://2012.jsconf.eu/">JSConf EU 2012</a>.
+The module approach failed.  In order to plant the timeout into Node, I
+first had to descend a level into the innards of V8 to teach it how to
+resume execution after terminating.  The reason why V8 needed to be
+modified is subtle — Node itself is written in script (for the
+most part) and V8 can not distinguish between “Node” script and “user”
+script.</p>
+
+<h3 id="stopping-execution">Stopping execution</h3>
+
+<p>The way a V8 embedder stops exection of an endless loop is to use the C++
+API <code>V8::TerminateExecution()</code>.  The thread running the endless loop
+is obviously busy, so this must be called from a different thread.
+Typically, a timer is used to limit the time a single call into the
+engine may take.  After the function has been called, the engine throws
+an uncatchable exception that propagates up to the embedder’s outer
+<code>v8::TryCatch</code>, which then lets the app do something else.</p>
+
+<p>This works great, except that engine may only again begin executing
+script after the exception is fully propagated and the entire Javascript
+stack is unwound.  Since most of Node itself is script frames, this
+results in unexpected behavior as the Node frames are unwound as well:</p>
+
+<div class="bogus-wrapper"><notextile><figure class="code"><figcaption><span></span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class="line-number">1</span>
+<span class="line-number">2</span>
+<span class="line-number">3</span>
+<span class="line-number">4</span>
+<span class="line-number">5</span>
+<span class="line-number">6</span>
+</pre></td><td class="code"><pre><code class="javascript"><span class="line"><span class="k">try</span> <span class="p">{</span>
+</span><span class="line">    <span class="nx">vm</span><span class="p">.</span><span class="nx">runInNewContext</span><span class="p">(</span><span class="s1">&#39;while(true) {}&#39;</span><span class="p">,</span> <span class="s1">&#39;&#39;</span><span class="p">,</span> <span class="mi">100</span><span class="p">);</span>
+</span><span class="line"><span class="p">}</span> <span class="k">catch</span><span class="p">(</span><span class="nx">e</span><span class="p">)</span> <span class="p">{</span>
+</span><span class="line">    <span class="c1">// C++ TryCatch did not throw, but an exception</span>
+</span><span class="line">    <span class="c1">// was caught here. Yet e === null??. Not good.</span>
+</span><span class="line"><span class="p">}</span>
+</span></code></pre></td></tr></table></div></figure></notextile></div>
+
+<p>I spoke with Vyacheslav Egorov while at JSConf and he indicated this was
+how <code>V8:TerminateExecution()</code> was designed to work, but that it should be
+possible to modify V8 to support resuming.  I couldn’t see anyone on the
+V8 team prioritizing this since it isn’t required for their use of the
+engine, so I set out to do it myself.</p>
+
+<h3 id="new-api">New API</h3>
+
+<p>V8 needed to be modified to allow a C++ <code>v8::TryCatch</code> to not only
+detect that a termination exception was thrown, but instruct the engine
+that things really are OK and execution can resume again.</p>
+
+<p>As part of the <a href="https://codereview.chromium.org/11142013/">changes</a> made to V8, <code>v8::TryCatch</code> received
+a new member <code>HasTerminated()</code>, which obviously allows an embedder to
+first detect that a termination exception has been thrown due to
+another thread calling <code>V8::TerminateExecution()</code>.</p>
+
+<p>Once such an exception has been caught, <code>V8::CancelTerminateExecution()</code>
+allows the embedder to tell the engine that script execution should
+continue after the call completes.  This function performs the magic
+needed to reset the engine to a sane state and allows the scripted Node
+frames still on the stack to continue executing.</p>
+
+<div class="bogus-wrapper"><notextile><figure class="code"><figcaption><span></span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class="line-number">1</span>
+<span class="line-number">2</span>
+<span class="line-number">3</span>
+<span class="line-number">4</span>
+<span class="line-number">5</span>
+<span class="line-number">6</span>
+<span class="line-number">7</span>
+<span class="line-number">8</span>
+<span class="line-number">9</span>
+<span class="line-number">10</span>
+<span class="line-number">11</span>
+<span class="line-number">12</span>
+<span class="line-number">13</span>
+<span class="line-number">14</span>
+<span class="line-number">15</span>
+</pre></td><td class="code"><pre><code class="c++"><span class="line"><span class="kt">void</span> <span class="n">Isolate</span><span class="o">::</span><span class="n">CancelTerminateExecution</span><span class="p">()</span> <span class="p">{</span>
+</span><span class="line">  <span class="k">if</span> <span class="p">(</span><span class="n">try_catch_handler</span><span class="p">())</span> <span class="p">{</span>
+</span><span class="line">    <span class="n">try_catch_handler</span><span class="p">()</span><span class="o">-&gt;</span><span class="n">has_terminated_</span> <span class="o">=</span> <span class="kc">false</span><span class="p">;</span>
+</span><span class="line">  <span class="p">}</span>
+</span><span class="line">  <span class="k">if</span> <span class="p">(</span><span class="n">has_pending_exception</span><span class="p">()</span> <span class="o">&amp;&amp;</span>
+</span><span class="line">      <span class="n">pending_exception</span><span class="p">()</span> <span class="o">==</span> <span class="n">heap_</span><span class="p">.</span><span class="n">termination_exception</span><span class="p">())</span> <span class="p">{</span>
+</span><span class="line">    <span class="n">thread_local_top</span><span class="p">()</span><span class="o">-&gt;</span><span class="n">external_caught_exception_</span> <span class="o">=</span> <span class="kc">false</span><span class="p">;</span>
+</span><span class="line">    <span class="n">clear_pending_exception</span><span class="p">();</span>
+</span><span class="line">  <span class="p">}</span>
+</span><span class="line">  <span class="k">if</span> <span class="p">(</span><span class="n">has_scheduled_exception</span><span class="p">()</span> <span class="o">&amp;&amp;</span>
+</span><span class="line">      <span class="n">scheduled_exception</span><span class="p">()</span> <span class="o">==</span> <span class="n">heap_</span><span class="p">.</span><span class="n">termination_exception</span><span class="p">())</span> <span class="p">{</span>
+</span><span class="line">    <span class="n">thread_local_top</span><span class="p">()</span><span class="o">-&gt;</span><span class="n">external_caught_exception_</span> <span class="o">=</span> <span class="kc">false</span><span class="p">;</span>
+</span><span class="line">    <span class="n">clear_scheduled_exception</span><span class="p">();</span>
+</span><span class="line">  <span class="p">}</span>
+</span><span class="line"><span class="p">}</span>
+</span></code></pre></td></tr></table></div></figure></notextile></div>
+
+<h3 id="watchdog">Watchdog</h3>
+
+<p>The final piece of the puzzle is wrapped up in the <code>node::Watchdog</code> class.
+Node is built around <code>libuv</code>, which provides the requisite event loop,
+timer, and thread primitives to implement the timeout.  This class takes
+care of spawning a new thread which runs a separate event loop that waits
+for either the timer to expire or for async notification that the
+<code>Watchdog</code> was destroyed because execution returned normally.</p>
+
+<p>The <code>uv_timer_t</code> handler couldn’t be simpler:</p>
+
+<div class="bogus-wrapper"><notextile><figure class="code"><figcaption><span></span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class="line-number">1</span>
+<span class="line-number">2</span>
+<span class="line-number">3</span>
+</pre></td><td class="code"><pre><code class="c++"><span class="line"><span class="kt">void</span> <span class="n">Watchdog</span><span class="o">::</span><span class="n">Timer</span><span class="p">(</span><span class="n">uv_timer_t</span><span class="o">*</span> <span class="n">timer</span><span class="p">,</span> <span class="kt">int</span> <span class="n">status</span><span class="p">)</span> <span class="p">{</span>
+</span><span class="line">  <span class="n">V8</span><span class="o">::</span><span class="n">TerminateExecution</span><span class="p">();</span>
+</span><span class="line"><span class="p">}</span>
+</span></code></pre></td></tr></table></div></figure></notextile></div>
+
+<p>As for the thread function, Ben Noordhuis pointed me towards using
+<code>uv_run()</code> with <code>UV_RUN_ONCE</code>, which lets the loop run only once and then
+exit after processing either the timer or async notification:</p>
+
+<div class="bogus-wrapper"><notextile><figure class="code"><figcaption><span></span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class="line-number">1</span>
+<span class="line-number">2</span>
+<span class="line-number">3</span>
+<span class="line-number">4</span>
+<span class="line-number">5</span>
+<span class="line-number">6</span>
+<span class="line-number">7</span>
+<span class="line-number">8</span>
+<span class="line-number">9</span>
+<span class="line-number">10</span>
+<span class="line-number">11</span>
+</pre></td><td class="code"><pre><code class="c++"><span class="line"><span class="kt">void</span> <span class="n">Watchdog</span><span class="o">::</span><span class="n">Run</span><span class="p">(</span><span class="kt">void</span><span class="o">*</span> <span class="n">arg</span><span class="p">)</span> <span class="p">{</span>
+</span><span class="line">  <span class="c1">// UV_RUN_ONCE so async_ or timer_ wakeup exits uv_run() call.</span>
+</span><span class="line">  <span class="n">uv_run</span><span class="p">(</span><span class="n">wd</span><span class="o">-&gt;</span><span class="n">loop_</span><span class="p">,</span> <span class="n">UV_RUN_ONCE</span><span class="p">);</span>
+</span><span class="line">
+</span><span class="line">  <span class="c1">// Loop ref count reaches zero when both handles are closed.</span>
+</span><span class="line">  <span class="n">uv_close</span><span class="p">(</span><span class="k">reinterpret_cast</span><span class="o">&lt;</span><span class="n">uv_handle_t</span><span class="o">*&gt;</span><span class="p">(</span><span class="o">&amp;</span><span class="n">wd</span><span class="o">-&gt;</span><span class="n">async_</span><span class="p">),</span> <span class="nb">NULL</span><span class="p">);</span>
+</span><span class="line">  <span class="n">uv_close</span><span class="p">(</span><span class="k">reinterpret_cast</span><span class="o">&lt;</span><span class="n">uv_handle_t</span><span class="o">*&gt;</span><span class="p">(</span><span class="o">&amp;</span><span class="n">wd</span><span class="o">-&gt;</span><span class="n">timer_</span><span class="p">),</span> <span class="nb">NULL</span><span class="p">);</span>
+</span><span class="line">
+</span><span class="line">  <span class="c1">// UV_RUN_DEFAULT so that libuv has a chance to clean up.</span>
+</span><span class="line">  <span class="n">uv_run</span><span class="p">(</span><span class="n">wd</span><span class="o">-&gt;</span><span class="n">loop_</span><span class="p">,</span> <span class="n">UV_RUN_DEFAULT</span><span class="p">);</span>
+</span><span class="line"><span class="p">}</span>
+</span></code></pre></td></tr></table></div></figure></notextile></div>
+
+<p>(I wouldn’t have gathered on my own that a <code>UV_RUN_DEFAULT</code> was needed in
+order to let <code>libuv</code> clean up after itself once the loop ref count
+reached zero.  This pattern is useful for anyone who wishes to implement
+anything similar with <code>libuv</code> in the future.)</p>
+
+<h3 id="resuming-execution">Resuming Execution</h3>
+
+<p>The V8 changes landed in <a href="https://code.google.com/p/v8/source/detail?r=14378">r14378</a>, and were released as part
+of v3.18.3.  Node updated its copy of V8 in <a href="https://github.com/joyent/node/commit/2f75785c015fecc33565fe5ee3a483b0d4e5cc6d">2f75785c01</a>.
+Modifying <a href="https://github.com/joyent/node/blob/v0.11.2-release/src/node_script.cc#L442"><code>node_script.cc#L442</code></a> to use the new API was
+then possible:</p>
+
+<div class="bogus-wrapper"><notextile><figure class="code"><figcaption><span></span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class="line-number">1</span>
+<span class="line-number">2</span>
+<span class="line-number">3</span>
+<span class="line-number">4</span>
+<span class="line-number">5</span>
+<span class="line-number">6</span>
+<span class="line-number">7</span>
+<span class="line-number">8</span>
+<span class="line-number">9</span>
+<span class="line-number">10</span>
+<span class="line-number">11</span>
+</pre></td><td class="code"><pre><code class="c++"><span class="line"><span class="k">if</span> <span class="p">(</span><span class="n">timeout</span><span class="p">)</span> <span class="p">{</span>
+</span><span class="line">  <span class="n">Watchdog</span> <span class="n">wd</span><span class="p">(</span><span class="n">timeout</span><span class="p">);</span>
+</span><span class="line">  <span class="n">result</span> <span class="o">=</span> <span class="n">script</span><span class="o">-&gt;</span><span class="n">Run</span><span class="p">();</span>
+</span><span class="line"><span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+</span><span class="line">  <span class="n">result</span> <span class="o">=</span> <span class="n">script</span><span class="o">-&gt;</span><span class="n">Run</span><span class="p">();</span>
+</span><span class="line"><span class="p">}</span>
+</span><span class="line"><span class="k">if</span> <span class="p">(</span><span class="n">try_catch</span><span class="p">.</span><span class="n">HasCaught</span><span class="p">()</span> <span class="o">&amp;&amp;</span> <span class="n">try_catch</span><span class="p">.</span><span class="n">HasTerminated</span><span class="p">())</span> <span class="p">{</span>
+</span><span class="line">  <span class="n">V8</span><span class="o">::</span><span class="n">CancelTerminateExecution</span><span class="p">(</span><span class="n">args</span><span class="p">.</span><span class="n">GetIsolate</span><span class="p">());</span>
+</span><span class="line">  <span class="k">return</span> <span class="n">ThrowException</span><span class="p">(</span><span class="n">Exception</span><span class="o">::</span><span class="n">Error</span><span class="p">(</span>
+</span><span class="line">        <span class="n">String</span><span class="o">::</span><span class="n">New</span><span class="p">(</span><span class="s">&quot;Script execution timed out.&quot;</span><span class="p">)));</span>
+</span><span class="line"><span class="p">}</span>
+</span></code></pre></td></tr></table></div></figure></notextile></div>
+
+<p>This is pretty much what any use of <code>TryCatch.HasTerminated()</code> and 
+<code>V8::CancelTerminateExecution()</code> will look like for anyone that embeds
+V8 and wishes to implement the same functionality.</p>
+
+<p>The implementation of the <code>timeout</code> parameter landed in
+<a href="https://github.com/joyent/node/commit/c081809344bd6e35c49a1c573b954583c0e3a27d">c081809344</a> and is present in Node v0.11 onward.</p>
+
+<h3 id="what-users-see">What Users See</h3>
+
+<p>Now, everyone can simply specify a timeout in milliseconds:</p>
+
+<div class="bogus-wrapper"><notextile><figure class="code"><figcaption><span>loop.js</span></figcaption><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class="line-number">1</span>
+<span class="line-number">2</span>
+<span class="line-number">3</span>
+<span class="line-number">4</span>
+<span class="line-number">5</span>
+<span class="line-number">6</span>
+</pre></td><td class="code"><pre><code class="javascript"><span class="line"><span class="kd">var</span> <span class="nx">vm</span> <span class="o">=</span> <span class="nx">require</span><span class="p">(</span><span class="s1">&#39;vm&#39;</span><span class="p">);</span>
+</span><span class="line"><span class="k">try</span> <span class="p">{</span>
+</span><span class="line">    <span class="nx">vm</span><span class="p">.</span><span class="nx">runInThisContext</span><span class="p">(</span><span class="s1">&#39;while(true) {}&#39;</span><span class="p">,</span> <span class="s1">&#39;&#39;</span><span class="p">,</span> <span class="mi">1000</span><span class="p">);</span>
+</span><span class="line"><span class="p">}</span> <span class="k">catch</span><span class="p">(</span><span class="nx">e</span><span class="p">)</span> <span class="p">{</span>
+</span><span class="line"><span class="p">}</span>
+</span><span class="line"><span class="nx">console</span><span class="p">.</span><span class="nx">log</span><span class="p">(</span><span class="s1">&#39;completed!&#39;</span><span class="p">);</span>
+</span></code></pre></td></tr></table></div></figure></notextile></div>
+
+<pre><code>$ time node loop.js 
+completed!
+
+real    0m1.080s
+user    0m1.056s
+sys     0m0.022s
+</code></pre>
+
+]]></content>
+  </entry>
+  
+</feed>

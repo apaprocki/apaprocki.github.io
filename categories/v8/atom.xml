@@ -1,0 +1,211 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+
+  <title><![CDATA[Category: v8 | apaprocki]]></title>
+  <link href="http://blog.paprocki.us/categories/v8/atom.xml" rel="self"/>
+  <link href="http://blog.paprocki.us/"/>
+  <updated>2013-06-03T16:40:00-04:00</updated>
+  <id>http://blog.paprocki.us/</id>
+  <author>
+    <name><![CDATA[Andrew Paprocki]]></name>
+    
+  </author>
+  <generator uri="http://octopress.org/">Octopress</generator>
+
+  
+  <entry>
+    <title type="html"><![CDATA[Implementing Timeouts in Node.js 'vm' Module]]></title>
+    <link href="http://blog.paprocki.us/2013/06/03/implementing-timeouts-in-node-dot-js-vm-module/"/>
+    <updated>2013-06-03T09:52:00-04:00</updated>
+    <id>http://blog.paprocki.us/2013/06/03/implementing-timeouts-in-node-dot-js-vm-module</id>
+    <content type="html"><![CDATA[<h3 id="trusted-but-unknown">Trusted, but Unknown</h3>
+
+<p>When I first started playing with the Node <a href="http://nodejs.org/api/vm.html"><code>vm</code></a> module, I was using
+it to execute trusted, but unknown script.  Using the <code>vm</code> module as a
+sandbox was a great way to get a prototype up and running quickly, but
+presented a few problems if this type of prototype were to ever run in
+a production environment.  The goal of the prototype was to give other
+developers the ability to execute script they wrote inside of my app.
+Everyone makes typos and mistakes, and if a fellow developer asked the
+sandbox to execute something which entered an endless loop, it would loop
+the <code>node</code> process and defeat the purpose of a multi-user non-blocking app.
+<!-- more --></p>
+
+<p>There are a few possible solutions to this problem.  It’s possible to use
+separate processes, perhaps with the <code>cluster</code> module to kill processes if
+they loop, but it is not always desirable to use additional <code>pid</code>s.  To
+get even more complicated, an entire JS engine such as
+<a href="https://github.com/jterrace/js.js/">js.js</a> could be embedded, allowing
+the outer code to monitor the interpreter and stop execution if necessary.
+Hey, it’s possible, but I would not want to increase the maintenance,
+security, and performance complexity of my app in that manner unless there
+was no other option.  I wanted to keep loop detection in-process, which
+meant interfacing C++ loop detection with Node.</p>
+
+<p>My first attempt at achieving this was writing a native module,
+<a href="https://github.com/apaprocki/node-scriptdog">node-scriptdog</a>, at <a href="http://2012.jsconf.eu/">JSConf EU 2012</a>.
+The module approach failed.  In order to plant the timeout into Node, I
+first had to descend a level into the innards of V8 to teach it how to
+resume execution after terminating.  The reason why V8 needed to be
+modified is subtle — Node itself is written in script (for the
+most part) and V8 can not distinguish between “Node” script and “user”
+script.</p>
+
+<h3 id="stopping-execution">Stopping execution</h3>
+
+<p>The way a V8 embedder stops exection of an endless loop is to use the C++
+API <code>V8::TerminateExecution()</code>.  The thread running the endless loop
+is obviously busy, so this must be called from a different thread.
+Typically, a timer is used to limit the time a single call into the
+engine may take.  After the function has been called, the engine throws
+an uncatchable exception that propagates up to the embedder’s outer
+<code>v8::TryCatch</code>, which then lets the app do something else.</p>
+
+<p>This works great, except that engine may only again begin executing
+script after the exception is fully propagated and the entire Javascript
+stack is unwound.  Since most of Node itself is script frames, this
+results in unexpected behavior as the Node frames are unwound as well:</p>
+
+<p><code>javascript
+try {
+    vm.runInNewContext('while(true) {}', '', 100);
+} catch(e) {
+    // C++ TryCatch did not throw, but an exception
+    // was caught here. Yet e === null??. Not good.
+}
+</code></p>
+
+<p>I spoke with Vyacheslav Egorov while at JSConf and he indicated this was
+how <code>V8:TerminateExecution()</code> was designed to work, but that it should be
+possible to modify V8 to support resuming.  I couldn’t see anyone on the
+V8 team prioritizing this since it isn’t required for their use of the
+engine, so I set out to do it myself.</p>
+
+<h3 id="new-api">New API</h3>
+
+<p>V8 needed to be modified to allow a C++ <code>v8::TryCatch</code> to not only
+detect that a termination exception was thrown, but instruct the engine
+that things really are OK and execution can resume again.</p>
+
+<p>As part of the <a href="https://codereview.chromium.org/11142013/">changes</a> made to V8, <code>v8::TryCatch</code> received
+a new member <code>HasTerminated()</code>, which obviously allows an embedder to
+first detect that a termination exception has been thrown due to
+another thread calling <code>V8::TerminateExecution()</code>.</p>
+
+<p>Once such an exception has been caught, <code>V8::CancelTerminateExecution()</code>
+allows the embedder to tell the engine that script execution should
+continue after the call completes.  This function performs the magic
+needed to reset the engine to a sane state and allows the scripted Node
+frames still on the stack to continue executing.</p>
+
+<p><code>c++
+void Isolate::CancelTerminateExecution() {
+  if (try_catch_handler()) {
+    try_catch_handler()-&gt;has_terminated_ = false;
+  }
+  if (has_pending_exception() &amp;&amp;
+      pending_exception() == heap_.termination_exception()) {
+    thread_local_top()-&gt;external_caught_exception_ = false;
+    clear_pending_exception();
+  }
+  if (has_scheduled_exception() &amp;&amp;
+      scheduled_exception() == heap_.termination_exception()) {
+    thread_local_top()-&gt;external_caught_exception_ = false;
+    clear_scheduled_exception();
+  }
+}
+</code></p>
+
+<h3 id="watchdog">Watchdog</h3>
+
+<p>The final piece of the puzzle is wrapped up in the <code>node::Watchdog</code> class.
+Node is built around <code>libuv</code>, which provides the requisite event loop,
+timer, and thread primitives to implement the timeout.  This class takes
+care of spawning a new thread which runs a separate event loop that waits
+for either the timer to expire or for async notification that the
+<code>Watchdog</code> was destroyed because execution returned normally.</p>
+
+<p>The <code>uv_timer_t</code> handler couldn’t be simpler:</p>
+
+<p><code>c++
+void Watchdog::Timer(uv_timer_t* timer, int status) {
+  V8::TerminateExecution();
+}
+</code></p>
+
+<p>As for the thread function, Ben Noordhuis pointed me towards using
+<code>uv_run()</code> with <code>UV_RUN_ONCE</code>, which lets the loop run only once and then
+exit after processing either the timer or async notification:</p>
+
+<p>``` c++
+void Watchdog::Run(void* arg) {
+  // UV_RUN_ONCE so async_ or timer_ wakeup exits uv_run() call.
+  uv_run(wd-&gt;loop_, UV_RUN_ONCE);</p>
+
+<p>// Loop ref count reaches zero when both handles are closed.
+  uv_close(reinterpret_cast&lt;uv_handle_t<em>&gt;(&amp;wd-&gt;async_), NULL);
+  uv_close(reinterpret_cast&lt;uv_handle_t</em>&gt;(&amp;wd-&gt;timer_), NULL);</p>
+
+<p>// UV_RUN_DEFAULT so that libuv has a chance to clean up.
+  uv_run(wd-&gt;loop_, UV_RUN_DEFAULT);
+}
+```</p>
+
+<p>(I wouldn’t have gathered on my own that a <code>UV_RUN_DEFAULT</code> was needed in
+order to let <code>libuv</code> clean up after itself once the loop ref count
+reached zero.  This pattern is useful for anyone who wishes to implement
+anything similar with <code>libuv</code> in the future.)</p>
+
+<h3 id="resuming-execution">Resuming Execution</h3>
+
+<p>The V8 changes landed in <a href="https://code.google.com/p/v8/source/detail?r=14378">r14378</a>, and were released as part
+of v3.18.3.  Node updated its copy of V8 in <a href="https://github.com/joyent/node/commit/2f75785c015fecc33565fe5ee3a483b0d4e5cc6d">2f75785c01</a>.
+Modifying <a href="https://github.com/joyent/node/blob/v0.11.2-release/src/node_script.cc#L442"><code>node_script.cc#L442</code></a> to use the new API was
+then possible:</p>
+
+<p><code>c++
+if (timeout) {
+  Watchdog wd(timeout);
+  result = script-&gt;Run();
+} else {
+  result = script-&gt;Run();
+}
+if (try_catch.HasCaught() &amp;&amp; try_catch.HasTerminated()) {
+  V8::CancelTerminateExecution(args.GetIsolate());
+  return ThrowException(Exception::Error(
+        String::New("Script execution timed out.")));
+}
+</code></p>
+
+<p>This is pretty much what any use of <code>TryCatch.HasTerminated()</code> and 
+<code>V8::CancelTerminateExecution()</code> will look like for anyone that embeds
+V8 and wishes to implement the same functionality.</p>
+
+<p>The implementation of the <code>timeout</code> parameter landed in
+<a href="https://github.com/joyent/node/commit/c081809344bd6e35c49a1c573b954583c0e3a27d">c081809344</a> and is present in Node v0.11 onward.</p>
+
+<h3 id="what-users-see">What Users See</h3>
+
+<p>Now, everyone can simply specify a timeout in milliseconds:</p>
+
+<p><code>javascript loop.js
+var vm = require('vm');
+try {
+    vm.runInThisContext('while(true) {}', '', 1000);
+} catch(e) {
+}
+console.log('completed!');
+</code></p>
+
+<pre><code>$ time node loop.js 
+completed!
+
+real    0m1.080s
+user    0m1.056s
+sys     0m0.022s
+</code></pre>
+
+]]></content>
+  </entry>
+  
+</feed>
